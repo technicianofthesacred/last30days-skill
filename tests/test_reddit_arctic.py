@@ -52,6 +52,81 @@ class TestFetchScores:
             reddit_arctic.fetch_scores(["abc"])  # served from cache, no 2nd call
         assert g.call_count == 1
 
+
+def _comment_row(author="u", body="great thread", score=42, created=1783000000):
+    return {
+        "id": "mjwb1hg", "author": author, "body": body, "score": score,
+        "created_utc": created,
+        "permalink": "/r/tea/comments/abc123/x/mjwb1hg/",
+        "link_id": "t3_abc123",
+    }
+
+
+class TestFetchPostComments:
+    def test_normalizes_and_sorts_archive_rows(self):
+        rows = [_comment_row(score=1), _comment_row(score=99), _comment_row(score=42)]
+        with mock.patch.object(reddit_arctic.http, "get", return_value=_resp(rows)) as get:
+            out = reddit_arctic.fetch_post_comments("abc123")
+        assert [item["score"] for item in out] == [99, 42, 1]
+        assert out[0]["author"] == "u"
+        assert out[0]["body"] == "great thread"
+        assert out[0]["excerpt"] == "great thread"
+        assert out[0]["date"] == "2026-07-02"
+        assert out[0]["url"] == "https://reddit.com/r/tea/comments/abc123/x/mjwb1hg/"
+        assert "link_id=t3_abc123" in get.call_args.args[0]
+        assert f"limit={reddit_arctic.MAX_COMMENT_ROWS}" in get.call_args.args[0]
+
+    def test_strips_post_prefix_and_bounds_request(self):
+        with mock.patch.object(reddit_arctic.http, "get", return_value=_resp([])) as get, \
+             mock.patch.object(reddit_arctic.time, "monotonic", return_value=100.0):
+            reddit_arctic.fetch_post_comments("t3_abc123")
+        assert "link_id=t3_abc123" in get.call_args.args[0]
+        assert get.call_args.kwargs["retries"] == 1
+        assert get.call_args.kwargs["timeout"] == reddit_arctic.TIMEOUT
+
+    def test_respects_shared_deadline(self):
+        with mock.patch.object(reddit_arctic.http, "get", return_value=_resp([])) as get, \
+             mock.patch.object(reddit_arctic.time, "monotonic", return_value=100.0):
+            reddit_arctic.fetch_post_comments("abc123", deadline=103.5)
+        assert get.call_args.kwargs["timeout"] == 3.5
+
+    def test_expired_deadline_skips_request(self):
+        with mock.patch.object(reddit_arctic.http, "get") as get, \
+             mock.patch.object(reddit_arctic.time, "monotonic", return_value=100.0):
+            assert reddit_arctic.fetch_post_comments("abc123", deadline=100.0) == []
+        get.assert_not_called()
+
+    def test_filters_deleted_comments_and_author_before_limit(self):
+        rows = [
+            _comment_row(author="[deleted]", score=900),
+            _comment_row(body="[removed]", score=800),
+            _comment_row(author="bot", score=500),
+            _comment_row(score=7),
+        ]
+        with mock.patch.object(reddit_arctic.http, "get", return_value=_resp(rows)):
+            out = reddit_arctic.fetch_post_comments(
+                "abc123", limit=1, skip_author=lambda author: author == "bot")
+        assert [item["score"] for item in out] == [7]
+
+    def test_bad_id_response_and_network_errors_degrade_to_empty(self):
+        with mock.patch.object(reddit_arctic.http, "get") as get:
+            assert reddit_arctic.fetch_post_comments("") == []
+            assert reddit_arctic.fetch_post_comments(None) == []
+        get.assert_not_called()
+        with mock.patch.object(reddit_arctic.http, "get", side_effect=Exception("boom")):
+            assert reddit_arctic.fetch_post_comments("abc123") == []
+        with mock.patch.object(reddit_arctic.http, "get", return_value={"error": "slow down"}):
+            assert reddit_arctic.fetch_post_comments("abc123") == []
+
+    def test_malformed_collections_and_rows_are_ignored_with_a_row_cap(self):
+        for response in (None, [], {"data": {}}, {"data": ["bad-row"]}):
+            with mock.patch.object(reddit_arctic.http, "get", return_value=response):
+                assert reddit_arctic.fetch_post_comments("abc123") == []
+        rows = [{"author": object(), "body": "not a string", "score": 5}] * 100
+        rows.append(_comment_row(score=500))
+        with mock.patch.object(reddit_arctic.http, "get", return_value=_resp(rows)):
+            assert reddit_arctic.fetch_post_comments("abc123") == []
+
     def test_dedupes_into_single_batch(self):
         with mock.patch.object(reddit_arctic.http, "get",
                                return_value=_resp([{"id": "a", "score": 1, "num_comments": 0},

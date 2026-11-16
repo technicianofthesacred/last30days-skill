@@ -17,10 +17,12 @@ cannot be recovered keylessly here (ScrapeCreators backup still provides it).
 import html as _html
 import re
 import sys
+import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from . import http
+from . import reddit_arctic
 from . import reddit_enrich
 
 # Up to N posts enriched per run, by depth (mirrors reddit_public.ENRICH_LIMITS).
@@ -34,6 +36,14 @@ ENRICH_LIMITS = {
 MAX_COMMENTS = 10
 
 SVC_TIMEOUT = 12
+BOT_AUTHORS = frozenset({
+    "automoderator", "remindmebot", "repostsleuthbot", "sneakpeekbot",
+    "savevideo", "videodownloadbot", "totesmessenger", "b0trank",
+    "amputatorbot", "stabbot", "gifreversingbot", "haikubotinaction",
+    "imagesofnetwork", "botdefense",
+})
+_BOT_SUFFIXES = ("-bot", "_bot")
+_CAMEL_BOT = re.compile(r"[a-z0-9]Bot\d*$")
 
 # Match the exact <shreddit-comment> element start tag, not <shreddit-comment-tree>
 # or <shreddit-comment-tree-stats> (lookahead requires whitespace or '>').
@@ -48,6 +58,18 @@ _NEXT_RTJSON = re.compile(r'id="t1_[A-Za-z0-9]+-(?:comment|post)-rtjson-content"
 def _log(msg: str) -> None:
     sys.stderr.write(f"[RedditShreddit] {msg}\n")
     sys.stderr.flush()
+
+
+def _is_bot_author(author: str) -> bool:
+    """Reject common bot names from archive results used as community signal."""
+    raw = (author or "").strip()
+    if not raw:
+        return False
+    return (
+        raw.lower() in BOT_AUTHORS
+        or raw.lower().endswith(_BOT_SUFFIXES)
+        or bool(_CAMEL_BOT.search(raw))
+    )
 
 
 def extract_post_ref(url: str) -> Optional[tuple]:
@@ -162,11 +184,34 @@ def fetch_comments(
         return {"top_comments": [], "comment_insights": [], "num_comments": None}
     sub, post_id = ref
 
-    html_text = http.reddit_keyless_get_text(_svc_url(sub, post_id), timeout=timeout, accept="text/html")
-    if not html_text:
+    started = time.monotonic()
+    try:
+        budget = max(0.0, float(timeout))
+    except (TypeError, ValueError):
+        budget = 0.0
+    deadline = started + budget
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
         return {"top_comments": [], "comment_insights": [], "num_comments": None}
+    html_text = http.reddit_keyless_get_text(
+        _svc_url(sub, post_id), timeout=remaining, retries=1, accept="text/html")
+    comments = parse_comments(html_text, limit=MAX_COMMENTS) if html_text else []
+    total = _total_comments(html_text) if html_text else None
+    if not comments:
+        # Some hosts receive 403s from Reddit's comment partial. Arctic Shift
+        # is a keyless fallback and ranks its archived comments by score.
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            try:
+                comments = reddit_arctic.fetch_post_comments(
+                    post_id, limit=MAX_COMMENTS, skip_author=_is_bot_author,
+                    deadline=deadline)
+            except Exception as exc:  # Optional enrichment never breaks the source.
+                _log(f"arctic comment fallback failed: {exc}")
+                comments = []
+    if not comments:
+        return {"top_comments": [], "comment_insights": [], "num_comments": total}
 
-    comments = parse_comments(html_text, limit=MAX_COMMENTS)
     insights = reddit_enrich.extract_comment_insights(comments)
     return {
         "top_comments": [
@@ -180,5 +225,5 @@ def fetch_comments(
             for c in comments
         ],
         "comment_insights": insights,
-        "num_comments": _total_comments(html_text),
+        "num_comments": total,
     }
