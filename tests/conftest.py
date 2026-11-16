@@ -9,10 +9,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "skills" / "last
 
 @pytest.fixture(autouse=True)
 def _no_arctic_network():
-    """Default the arctic-shift score lookup to a no-op so the suite never makes
-    a real network call. test_reddit_arctic overrides this fixture (same name) to
-    exercise the real lookup with http.get mocked."""
-    with mock.patch("lib.reddit_arctic.fetch_scores", return_value={}):
+    """Default Arctic lookups to no-ops so the suite never makes network calls.
+    test_reddit_arctic overrides this fixture (same name) to exercise score and
+    comment lookups with http.get mocked."""
+    with mock.patch("lib.reddit_arctic.fetch_scores", return_value={}), \
+         mock.patch("lib.reddit_arctic.fetch_post_comments", return_value=[]):
         yield
 
 

@@ -17,15 +17,17 @@ count rather than failing the Reddit source.
 import sys
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from . import http
 
 API = "https://arctic-shift.photon-reddit.com/api/posts/ids"
 SEARCH_API = "https://arctic-shift.photon-reddit.com/api/posts/search"
+COMMENTS_API = "https://arctic-shift.photon-reddit.com/api/comments/search"
 BATCH = 50          # ids per request
 TIMEOUT = 15
 MAX_BATCHES = 3     # cap total requests per run (bounds latency + rate-limit risk)
+MAX_COMMENT_ROWS = 100
 PACE_SECONDS = 0.4  # gap between batches; arctic-shift answers 422 "slow down"
 CACHE_MAX = 4096    # hard size bound so the in-run memo can never grow unbounded
 # Listing-lane knobs. Base limits mirror reddit_listing's DEPTH_LIMITS so callers
@@ -109,7 +111,7 @@ def fetch_scores(post_ids: List[str]) -> Dict[str, Dict[str, int]]:
 
 
 def _epoch_to_date(value: Any) -> Optional[str]:
-    """Epoch seconds -> YYYY-MM-DD (UTC), or None on garbage."""
+    """Convert an archive timestamp to a UTC date, or None if malformed."""
     try:
         return datetime.fromtimestamp(int(value), tz=timezone.utc).date().isoformat()
     except (TypeError, ValueError, OSError):
@@ -231,3 +233,69 @@ def fetch_listings(
             seen.add(p["url"])
             unique.append(p)
     return unique
+
+
+def fetch_post_comments(
+    post_id: str,
+    limit: int = 10,
+    skip_author: Optional[Callable[[str], bool]] = None,
+    deadline: Optional[float] = None,
+) -> List[Dict[str, Any]]:
+    """Fetch a post's highest-scored comments before the optional deadline."""
+    pid = str(post_id or "").removeprefix("t3_")
+    if not pid:
+        return []
+    now = time.monotonic()
+    end = now + TIMEOUT if deadline is None else min(deadline, now + TIMEOUT)
+    remaining = end - now
+    if remaining <= 0:
+        return []
+    try:
+        data = http.get(
+            f"{COMMENTS_API}?link_id=t3_{pid}&limit={MAX_COMMENT_ROWS}&sort=desc",
+            headers={"User-Agent": http.BROWSER_USER_AGENT},
+            timeout=remaining,
+            retries=1,
+        )
+    except Exception as exc:
+        _log(f"comments lookup failed t3_{pid}: {exc}")
+        return []
+    rows = data.get("data") if isinstance(data, dict) else None
+    if not isinstance(rows, list):
+        _log(f"unexpected comments response for t3_{pid}: {str(data)[:80]}")
+        return []
+
+    comments: List[Dict[str, Any]] = []
+    for row in rows[:MAX_COMMENT_ROWS]:
+        if not isinstance(row, dict):
+            continue
+        author = row.get("author") or "[deleted]"
+        body = row.get("body") or ""
+        if not isinstance(author, str) or not isinstance(body, str):
+            continue
+        if author in ("[deleted]", "[removed]") or body in ("[deleted]", "[removed]"):
+            continue
+        if skip_author:
+            try:
+                if skip_author(author):
+                    continue
+            except Exception:
+                continue
+        try:
+            score = int(row.get("score") or 0)
+        except (TypeError, ValueError):
+            score = 0
+        permalink = row.get("permalink") or ""
+        if not isinstance(permalink, str):
+            permalink = ""
+        comments.append({
+            "score": score,
+            "author": author,
+            "body": body[:300],
+            "excerpt": body[:200],
+            "permalink": permalink,
+            "date": _epoch_to_date(row.get("created_utc")),
+            "url": f"https://reddit.com{permalink}" if permalink else "",
+        })
+    comments.sort(key=lambda comment: comment["score"], reverse=True)
+    return comments[:max(0, limit)]

@@ -3,6 +3,8 @@
 from pathlib import Path
 from unittest import mock
 
+import pytest
+
 from lib import reddit_shreddit as rs
 
 FIXTURE = Path(__file__).resolve().parent.parent / "fixtures" / "reddit_shreddit_comments_sample.html"
@@ -10,6 +12,12 @@ FIXTURE = Path(__file__).resolve().parent.parent / "fixtures" / "reddit_shreddit
 
 def _html():
     return FIXTURE.read_text(encoding="utf-8")
+
+
+@pytest.fixture(autouse=True)
+def _no_arctic_network():
+    """This module mocks Arctic's HTTP adapter directly when exercising fallback."""
+    yield
 
 
 class TestExtractPostRef:
@@ -98,6 +106,77 @@ class TestFetchComments:
 
     def test_fetch_failure_returns_empty(self):
         url = "https://www.reddit.com/r/Rakuten/comments/1taeiw0/title/"
-        with mock.patch.object(rs.http, "get_text", return_value=None):
+        with mock.patch.object(rs.http, "get_text", return_value=None), \
+             mock.patch.object(rs.reddit_arctic, "fetch_post_comments", return_value=[]):
             out = rs.fetch_comments(url)
         assert out["top_comments"] == [] and out["num_comments"] is None
+
+
+class TestFetchCommentsFallback:
+    URL = "https://www.reddit.com/r/Rakuten/comments/1taeiw0/title/"
+
+    def test_uses_archive_only_when_shreddit_has_no_comments(self):
+        archived = [{
+            "score": 42, "date": "2026-07-02", "author": "u",
+            "excerpt": "great thread", "url": "https://reddit.com/r/Rakuten/comments/1taeiw0/x/",
+        }]
+        with mock.patch.object(rs.http, "reddit_keyless_get_text", return_value=None) as direct, \
+             mock.patch.object(rs.reddit_arctic, "fetch_post_comments", return_value=archived) as fallback, \
+             mock.patch.object(rs.time, "monotonic", side_effect=[100.0, 100.0, 100.25]):
+            out = rs.fetch_comments(self.URL)
+        assert out["top_comments"] == archived
+        assert isinstance(out["comment_insights"], list)
+        assert out["num_comments"] is None
+        direct.assert_called_once_with(
+            rs._svc_url("Rakuten", "1taeiw0"), timeout=12.0, retries=1, accept="text/html")
+        fallback.assert_called_once_with(
+            "1taeiw0", limit=rs.MAX_COMMENTS, skip_author=rs._is_bot_author,
+            deadline=112.0)
+
+    def test_archive_fallback_skips_bot_authors(self):
+        assert rs._is_bot_author("AutoModerator")
+        assert rs._is_bot_author("WikiTextBot")
+        assert rs._is_bot_author("helper_bot")
+        assert not rs._is_bot_author("Talbot")
+        assert not rs._is_bot_author("ordinary-user")
+        rows = [
+            {"author": "AutoModerator", "body": "A long bot post with no community signal.",
+             "score": 100, "created_utc": 1783000000, "permalink": "/r/x/comments/a/b/"},
+            {"author": "WikiTextBot", "body": "Another long automated comment to skip.",
+             "score": 90, "created_utc": 1783000000, "permalink": "/r/x/comments/a/c/"},
+            {"author": "ordinary-user", "body": "A useful human comment with enough words to keep.",
+             "score": 8, "created_utc": 1783000000, "permalink": "/r/x/comments/a/d/"},
+        ]
+        with mock.patch.object(rs.http, "reddit_keyless_get_text", return_value=None), \
+             mock.patch.object(rs.reddit_arctic.http, "get", return_value={"data": rows}):
+            out = rs.fetch_comments(self.URL)
+        assert [comment["author"] for comment in out["top_comments"]] == ["ordinary-user"]
+
+    def test_shreddit_results_remain_preferred(self):
+        with mock.patch.object(rs.http, "reddit_keyless_get_text", return_value=_html()), \
+             mock.patch.object(rs.reddit_arctic, "fetch_post_comments") as fallback:
+            out = rs.fetch_comments(self.URL)
+        assert out["top_comments"]
+        assert out["num_comments"] == 14
+        fallback.assert_not_called()
+
+    def test_empty_fallback_preserves_shreddit_total(self):
+        html = '<shreddit-comment-tree-stats total-comments="37"></shreddit-comment-tree-stats>'
+        with mock.patch.object(rs.http, "reddit_keyless_get_text", return_value=html), \
+             mock.patch.object(rs.reddit_arctic, "fetch_post_comments", return_value=[]):
+            out = rs.fetch_comments(self.URL)
+        assert out["top_comments"] == [] and out["num_comments"] == 37
+
+    def test_archive_failure_never_breaks_enrichment(self):
+        with mock.patch.object(rs.http, "reddit_keyless_get_text", return_value=None), \
+             mock.patch.object(rs.reddit_arctic, "fetch_post_comments", side_effect=Exception("boom")):
+            out = rs.fetch_comments(self.URL)
+        assert out == {"top_comments": [], "comment_insights": [], "num_comments": None}
+
+    def test_spent_direct_request_budget_skips_archive_request(self):
+        with mock.patch.object(rs.http, "reddit_keyless_get_text", return_value=None), \
+             mock.patch.object(rs.reddit_arctic, "fetch_post_comments") as fallback, \
+             mock.patch.object(rs.time, "monotonic", side_effect=[100.0, 100.0, 112.0]):
+            out = rs.fetch_comments(self.URL, timeout=12)
+        assert out == {"top_comments": [], "comment_insights": [], "num_comments": None}
+        fallback.assert_not_called()
